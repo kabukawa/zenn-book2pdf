@@ -1,0 +1,8 @@
+output/
+cache/
+__pycache__/
+_mermaid_render_tmp.html
+mermaid.min.js
+*.pyc
+.DS_Store
+Thumbs.db
