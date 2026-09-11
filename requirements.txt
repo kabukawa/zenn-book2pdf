@@ -3,3 +3,5 @@ beautifulsoup4
 markdownify
 markdown
 playwright
+pygments
+Pillow

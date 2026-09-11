@@ -9,8 +9,11 @@
 - Zenn の本の URL から、章一覧・タイトル・著者・表紙を取得する
 - 各章を Markdown（`output/chapters/`）として保存する
 - 表紙・目次・章ごとの改ページ付きの結合 HTML を作る（ファイル名は本のタイトル）
+- 巻末に奥付を付ける（出典の Zenn URL と、著作権が本の作者にある旨）
 - 同じ名前の A4 PDF を Playwright（Chromium）で自動出力する
 - `--epub` で同じ名前の EPUB を作る（**Calibre のインストールが必須**）
+- コードブロックは Pygments でシンタックスハイライトする
+- `--bw` で EPUB の Mermaid 図・写真・コードハイライトを白黒の高コントラストにする（表紙はカラーのまま。Kindle 電子ペーパー向け）
 - 本文中の Mermaid 図はローカルの Chromium で描画する（失敗時のみ `mermaid.ink`）
   - PDF / HTML では SVG（文字サイズが図ごとにばらつかないよう mm で実寸を焼く）
   - EPUB / Kindle では文字が消えないよう透明 PNG にし、小さい図はページ幅いっぱいに伸ばさない
@@ -157,11 +160,17 @@ zenn-book2pdf --html-only https://zenn.dev/USER/books/BOOK-SLUG
 # HTML と EPUB だけ（PDF なし。Calibre が必要）
 zenn-book2pdf --html-only --epub https://zenn.dev/USER/books/BOOK-SLUG
 
-# 既存の結合 HTML から PDF だけ作り直す
+# 既存の結合 HTML から PDF だけ作り直す（再取得しない）
 zenn-book2pdf --pdf-only
 
-# 既存の結合 HTML から EPUB だけ作り直す（Calibre が必要）
+# 既存の結合 HTML から EPUB だけ作り直す（再取得しない。Calibre が必要）
 zenn-book2pdf --epub-only
+
+# URL を付けた --epub-only。出典が同じなら HTML を再利用、違う／無いなら取得からやり直す
+zenn-book2pdf --epub-only https://zenn.dev/USER/books/BOOK-SLUG
+
+# Kindle 電子ペーパー向けに図とコードを白黒にする
+zenn-book2pdf --epub-only --bw
 
 # 既存 HTML から PDF と EPUB の両方
 zenn-book2pdf --pdf-only --epub-only
@@ -191,13 +200,13 @@ python fetch_zenn_book.py --epub https://zenn.dev/USER/books/BOOK-SLUG
 
 ## 生成されるファイル
 
-`--pdf-only` / `--epub-only` 以外では、毎回 `output/images`・`output/chapters` と前回の結合 HTML / PDF / EPUB を作り直します。Mermaid の描画結果は `cache/mermaid/` に残り、再実行では描画を省略できます。
+URL 付きの通常実行では、毎回 `output/images`・`output/chapters` と前回の結合 HTML / PDF / EPUB を作り直します。`--pdf-only` / `--epub-only` は既存の結合 HTML をキャッシュとして使い、Zenn からの再取得はしません。ただし URL を付けたときは、HTML の出典（奥付の Zenn URL）と一致する場合だけ再利用し、違う本・出典不明・HTML 無しのときは取得からやり直します。Mermaid の描画結果は `cache/mermaid/` に残り、再実行では描画を省略できます。
 
 | ファイル / フォルダ | 内容 |
 |---|---|
 | `output/chapters/NN-slug.md` | 章ごとの Markdown |
 | `output/images/` | 本文画像と Mermaid 図（SVG。EPUB 用に PNG も作る） |
-| `output/<本のタイトル>.html` | 表紙・目次・全章の印刷用 HTML |
+| `output/<本のタイトル>.html` | 表紙・目次・全章の印刷用 HTML（巻末に出典 URL と著作権表示） |
 | `output/<本のタイトル>.pdf` | A4 の結合 PDF（`--html-only` のときは作らない） |
 | `output/<本のタイトル>.epub` | Kindle 向け EPUB（`--epub` / `--epub-only` のとき。Calibre 必須） |
 | `output/_debug_book_api.json` | Zenn API の生レスポンス（調査用） |
@@ -211,16 +220,17 @@ python fetch_zenn_book.py --epub https://zenn.dev/USER/books/BOOK-SLUG
 
 | 引数 | 必須 | 説明 |
 |---|---|---|
-| 第1引数（URL） | 任意 | 本のトップまたは章ビューアの URL。省略時は内蔵のデフォルト。`--pdf-only` / `--epub-only` では不要 |
+| 第1引数（URL） | 任意 | 本のトップまたは章ビューアの URL。省略時は内蔵のデフォルト。`--pdf-only` / `--epub-only` に付けると、既存 HTML の出典と照合する |
 | `--html-only` | 任意 | PDF を作らない。`--epub` と併用すれば HTML と EPUB だけ作る |
-| `--pdf-only` | 任意 | 既存の結合 HTML から PDF だけ作る（再取得しない） |
+| `--pdf-only` | 任意 | 既存の結合 HTML から PDF だけ作る。URL を付けて出典が違う／無いときは再取得する |
 | `--epub` | 任意 | EPUB も作る。**Calibre（ebook-convert）が必須** |
-| `--epub-only` | 任意 | 既存の結合 HTML から EPUB だけ作る。**Calibre が必須** |
+| `--epub-only` | 任意 | 既存の結合 HTML から EPUB だけ作る。URL を付けて出典が違う／無いときは再取得する。**Calibre が必須** |
+| `--bw` | 任意 | EPUB の図・写真・コードを白黒の高コントラストにする（表紙はカラーのまま。Kindle 電子ペーパー向け）。PDF はカラーのまま |
 | `--no-epub` | 任意 | `--epub` を打ち消す |
 | `--output-dir DIR` | 任意 | 出力フォルダ。既定は `output`（ラッパー利用時はプロジェクト配下） |
 | `--workers N` | 任意 | 章取得の並列数。既定は 6 |
 | `--verbose` / `-v` | 任意 | Playwright や Calibre の詳細ログ |
-| `--version` / `-V` | 任意 | バージョンを表示して終了する（現在は v1.0） |
+| `--version` / `-V` | 任意 | バージョンを表示して終了する（現在は v1.1） |
 | `--no-mermaid-cache` | 任意 | 図キャッシュを使わず全部描き直す |
 
 ## エラーメッセージと対処法
@@ -248,7 +258,7 @@ EPUB の前提条件を満たしていません。
 2. ターミナルを開き直す
 3. `ebook-convert --version` が通るか確認する
 4. 通らないときは `$env:EBOOK_CONVERT` に `ebook-convert.exe` のフルパスを入れる
-5. `zenn-book2pdf --epub-only` で既存 HTML から EPUB だけ作り直せる
+5. 既存 HTML があれば `zenn-book2pdf --epub-only` で EPUB だけ作り直せる。HTML が無いときは URL を付けて `zenn-book2pdf --epub-only URL`
 
 ### Mermaid 図の描画で `mermaid.ink` のエラーが出る／時間がかかる
 
@@ -256,7 +266,7 @@ EPUB の前提条件を満たしていません。
 
 ### EPUB で図の文字が消える／図がページ幅いっぱいに広がる／白い箱が浮かぶ
 
-過去の版の既知の不具合です。最新版では EPUB 用に図を透明 PNG 化し、幅は PDF と同じ基準で％指定します。`output` を消してから `zenn-book2pdf --epub-only` を再実行してください。
+過去の版の既知の不具合です。最新版では EPUB 用に図を透明 PNG 化し、幅は PDF と同じ基準で％指定します。`output` を消してから `zenn-book2pdf --epub-only URL` で取得し直してください。
 
 ### 章が正しく取得できない／本の一部しか取得されない
 

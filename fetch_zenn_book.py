@@ -41,7 +41,7 @@ try:
 except Exception:
     pass
 
-VERSION = "1.0"
+VERSION = "1.1"
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ZennBookFetcher/" + VERSION + ")"}
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -228,6 +228,7 @@ def parse_args(argv=None):
             "  zenn-book2pdf --epub URL\n"
             "  zenn-book2pdf --pdf-only\n"
             "  zenn-book2pdf --epub-only\n"
+            "  zenn-book2pdf --epub-only --bw\n"
             "  zenn-book2pdf --html-only URL\n"
             "  .\\zenn-book2pdf.ps1 --epub URL\n"
             "  ./zenn-book2pdf.sh --epub URL\n"
@@ -254,7 +255,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--pdf-only",
         action="store_true",
-        help="既存の結合 HTML から PDF だけ生成する（再取得しない）",
+        help="既存の結合 HTML から PDF だけ生成する。URL を付けて出典が違うときは再取得する",
     )
     parser.add_argument(
         "--epub",
@@ -264,12 +265,17 @@ def parse_args(argv=None):
     parser.add_argument(
         "--epub-only",
         action="store_true",
-        help="既存の結合 HTML から EPUB だけ生成する（再取得しない）",
+        help="既存の結合 HTML から EPUB だけ生成する。URL を付けて出典が違うときは再取得する",
     )
     parser.add_argument(
         "--no-epub",
         action="store_true",
         help="EPUB を生成しない（--epub を打ち消す）",
+    )
+    parser.add_argument(
+        "--bw",
+        action="store_true",
+        help="EPUB の図・写真・コードを白黒の高コントラストにする（表紙はカラーのまま。Kindle 電子ペーパー向け）",
     )
     parser.add_argument(
         "--output-dir",
@@ -317,6 +323,53 @@ def parse_book_url(url):
     if not m:
         raise ValueError("Zenn の本の URL として解釈できません: " + url)
     return m.group(1), m.group(2)
+
+
+def canonical_book_url(username, book_slug):
+    """本のトップページ URL（章ビューアではなく books/slug）。"""
+    return "%s/%s/books/%s" % (ZENN_ORIGIN.rstrip("/"), username, book_slug)
+
+
+def should_reuse_cached_book(arg_url, cached_url):
+    """--pdf-only / --epub-only で既存 HTML を使ってよいか。
+
+    URL を付けていないときは既存 HTML を使う。
+    URL を付けたときは、既存 HTML の出典（username/slug）が一致するときだけ使う。
+    """
+    if not arg_url:
+        return True
+    if not cached_url:
+        return False
+    try:
+        return parse_book_url(arg_url) == parse_book_url(cached_url)
+    except ValueError:
+        return False
+
+
+def read_cached_book_url(out_dir):
+    """結合 HTML の奥付メタから出典 URL を読む。無ければ None。"""
+    html_path = find_book_html_for_pdf(out_dir)
+    if not html_path:
+        return None
+    try:
+        with open(html_path, encoding="utf-8") as f:
+            url = source_url_from_html(f.read())
+        if not url:
+            return None
+        username, slug = parse_book_url(url)
+        return canonical_book_url(username, slug)
+    except Exception:
+        return None
+
+
+def _html_esc(text):
+    return (
+        str(text or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
 
 def fetch_page_title(url):
@@ -1078,9 +1131,129 @@ def process_chapter(meta, username, book_slug, fallback_position):
 # 結合 HTML
 # ---------------------------------------------------------------------------
 
-def build_book_html(book_title, book_subtitle, author, cover_image_local, chapters):
+def _markdown_to_html(markdown_body):
     import markdown as mdlib
 
+    extensions = ["tables", "fenced_code"]
+    configs = {}
+    try:
+        import pygments  # noqa: F401
+        extensions.append("codehilite")
+        configs["codehilite"] = {
+            "linenums": False,
+            "guess_lang": True,
+            "css_class": "highlight",
+        }
+    except ImportError:
+        pass
+    return mdlib.markdown(
+        markdown_body,
+        extensions=extensions,
+        extension_configs=configs,
+    )
+
+
+def _codehilite_css(bw=False):
+    try:
+        from pygments.formatters import HtmlFormatter
+        style = "bw" if bw else "default"
+        css = HtmlFormatter(style=style).get_style_defs(".highlight")
+    except Exception:
+        return (
+            "  .highlight { background: #f5f5f5; padding: 0.8em; overflow-wrap: anywhere; }\n"
+            "  .highlight pre { background: transparent; padding: 0; margin: 0; }\n"
+        )
+    extra = (
+        "\n.highlight { padding: 0.8em; overflow-wrap: anywhere; }\n"
+        ".highlight pre { background: transparent; padding: 0; margin: 0; white-space: pre-wrap; }\n"
+        ".highlight code { background: transparent; padding: 0; }\n"
+    )
+    if bw:
+        # pygments の bw でもエラー枠が赤、行ハイライトが黄のまま残る
+        css = re.sub(r"border:\s*1px solid #F00", "border: none", css, flags=re.I)
+        css = re.sub(
+            r"background(?:-color)?:\s*#ffffc[0-9a-f]{1,2}",
+            "background: transparent",
+            css,
+            flags=re.I,
+        )
+        extra += (
+            ".highlight { background: transparent; border: 1px solid #000; }\n"
+            ".highlight .c, .highlight .c1, .highlight .cm { color: #444 !important; }\n"
+            ".err { border: none !important; background: transparent !important; }\n"
+        )
+    else:
+        extra += ".highlight { background: #f8f8f8; }\n"
+    return css + extra
+
+
+def _colophon_css():
+    return (
+        "  .colophon { page-break-before: always; break-before: page; margin-top: 0; font-size: 0.95em; }\n"
+        "  .colophon h1 { margin-top: 0; font-size: 1.4em; }\n"
+        "  .colophon .source-url { word-break: break-all; overflow-wrap: anywhere; }\n"
+    )
+
+
+def _colophon_section(source_url, author):
+    url = _html_esc(source_url)
+    author_esc = _html_esc(author).strip()
+    if author_esc:
+        rights = "本文および図版の著作権は、本の作者（" + author_esc + "）にあります。"
+    else:
+        rights = "本文および図版の著作権は、本の作者にあります。"
+    return (
+        '<section id="colophon" class="colophon">\n'
+        "  <h1>奥付</h1>\n"
+        "  <p>このファイルは、次の URL で公開されている本を元に作成しました。</p>\n"
+        '  <p class="source-url"><a href="' + url + '">' + url + "</a></p>\n"
+        "  <p>" + rights + "</p>\n"
+        "  <p>このファイルの作成は、著作権を移転するものではありません。</p>\n"
+        "</section>\n"
+    )
+
+
+def source_url_from_html(html_text):
+    m = re.search(
+        r'<meta\s+name="zenn-source-url"\s+content="([^"]+)"',
+        html_text or "",
+        re.I,
+    )
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def ensure_colophon_html(html_text, source_url, author):
+    """巻末の奥付が無ければ追加する。既にある場合はそのまま。"""
+    if not html_text or not source_url:
+        return html_text
+    if re.search(r'class=["\']colophon["\']', html_text):
+        return html_text
+    out = html_text
+    if 'name="zenn-source-url"' not in out:
+        meta = '<meta name="zenn-source-url" content="' + _html_esc(source_url) + '">\n'
+        if '<meta charset="utf-8">' in out:
+            out = out.replace('<meta charset="utf-8">', '<meta charset="utf-8">\n' + meta, 1)
+        elif "<head>" in out:
+            out = out.replace("<head>", "<head>\n" + meta, 1)
+    if ".colophon {" not in out and "</style>" in out:
+        out = out.replace("</style>", _colophon_css() + "</style>", 1)
+    if 'href="#colophon"' not in out:
+        out = re.sub(
+            r'(<div class="toc">[\s\S]*?)</ul>',
+            r'\1    <li><a href="#colophon">奥付</a></li>\n  </ul>',
+            out,
+            count=1,
+        )
+    if "</body>" in out:
+        out = out.replace("</body>", _colophon_section(source_url, author) + "\n</body>", 1)
+    else:
+        out = out + "\n" + _colophon_section(source_url, author)
+    return out
+
+
+def build_book_html(book_title, book_subtitle, author, cover_image_local, chapters, source_url=None):
     toc_items = []
     sections = []
     for i, ch in enumerate(chapters):
@@ -1091,12 +1264,14 @@ def build_book_html(book_title, book_subtitle, author, cover_image_local, chapte
         toc_items.append(
             '<li><a href="#' + anchor + '">第' + str(position) + "章 " + str(title) + "</a></li>"
         )
-        html_body = mdlib.markdown(markdown_body, extensions=["tables", "fenced_code"])
+        html_body = _markdown_to_html(markdown_body)
         section_class = "chapter-section first-chapter" if i == 0 else "chapter-section"
         sections.append(
             '<section id="' + anchor + '" class="' + section_class + '"><h1>第'
             + str(position) + "章 " + str(title) + "</h1>" + html_body + "</section>"
         )
+    if source_url:
+        toc_items.append('<li><a href="#colophon">奥付</a></li>')
 
     cover_subtitle_html = ("<p>" + book_subtitle + "</p>") if book_subtitle else ""
     cover_author_html = ("<p>" + author + "</p>") if author else ""
@@ -1140,14 +1315,23 @@ def build_book_html(book_title, book_subtitle, author, cover_image_local, chapte
         "  .first-chapter { page-break-before: avoid; break-before: avoid; }\n"
         "  .chapter-section h1 { margin-top: 0; }\n"
         "  .cover-image { max-width: 80%; max-height: 220mm; height: auto; display: block; margin: 0 auto; }\n"
+        + (_colophon_css() if source_url else "")
+        + _codehilite_css(bw=False)
     )
+
+    source_meta = ""
+    colophon_html = ""
+    if source_url:
+        source_meta = '<meta name="zenn-source-url" content="' + _html_esc(source_url) + '">\n'
+        colophon_html = "\n" + _colophon_section(source_url, author)
 
     return (
         "<!DOCTYPE html>\n"
         '<html lang="ja">\n'
         "<head>\n"
         '<meta charset="utf-8">\n'
-        "<title>" + str(book_title) + "</title>\n"
+        + source_meta
+        + "<title>" + str(book_title) + "</title>\n"
         "<style>\n" + css + "</style>\n"
         "</head>\n"
         "<body>\n\n"
@@ -1162,6 +1346,7 @@ def build_book_html(book_title, book_subtitle, author, cover_image_local, chapte
         "  <ul>\n" + "".join(toc_items) + "\n  </ul>\n"
         "</div>\n\n"
         + "".join(sections)
+        + colophon_html
         + "\n\n</body>\n</html>\n"
     )
 
@@ -1443,14 +1628,68 @@ def _diagram_width_percent(svg_path, png_path=None):
     return max(12, min(100, pct))
 
 
-def _rasterize_svg_to_png(page, svg_path, png_path):
+def _bw_variant_rel(src):
+    root, ext = os.path.splitext(src.replace("\\", "/"))
+    base = os.path.basename(root)
+    if base.endswith(".bw"):
+        return src.replace("\\", "/")
+    return root + ".bw" + ext
+
+
+def _is_cover_img(img):
+    """表紙画像（--bw でもカラーのままにする）。"""
+    classes = img.get("class") or []
+    if isinstance(classes, str):
+        classes = classes.split()
+    if "cover-image" in classes:
+        return True
+    parent = img.parent
+    while parent is not None:
+        pclasses = parent.get("class") or []
+        if isinstance(pclasses, str):
+            pclasses = pclasses.split()
+        if "cover-image-page" in pclasses:
+            return True
+        parent = getattr(parent, "parent", None)
+    return False
+
+
+def _write_grayscale_image(src_path, dest_path):
+    """通常画像を高コントラストのグレースケールにして保存する。"""
+    from PIL import Image, ImageEnhance, ImageOps
+
+    im = Image.open(src_path)
+    has_alpha = im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info)
+    os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+    if has_alpha:
+        im = im.convert("RGBA")
+        alpha = im.split()[-1]
+        gray = ImageOps.grayscale(im)
+        gray = ImageEnhance.Contrast(gray).enhance(1.25)
+        Image.merge("LA", (gray, alpha)).convert("RGBA").save(dest_path, "PNG")
+        return
+    gray = ImageOps.grayscale(im.convert("RGB"))
+    gray = ImageEnhance.Contrast(gray).enhance(1.2)
+    ext = os.path.splitext(dest_path)[1].lower()
+    if ext in (".jpg", ".jpeg"):
+        gray.convert("RGB").save(dest_path, "JPEG", quality=90)
+    else:
+        gray.save(dest_path)
+
+
+def _strip_highlight_css(css_text):
+    return re.sub(r"\.highlight[^{]*\{[^}]*\}", "", css_text or "")
+
+
+def _rasterize_svg_to_png(page, svg_path, png_path, grayscale=False):
     """Kindle は SVG の foreignObject（Mermaid の文字）を描かないので PNG にする。"""
     svg_text = Path(svg_path).read_text(encoding="utf-8")
     svg_text = re.sub(r"<\?xml[^?]*\?>", "", svg_text).strip()
+    svg_filter = "filter:grayscale(1) contrast(1.5);" if grayscale else ""
     html = (
         "<!DOCTYPE html><html><head><meta charset='utf-8'>"
         "<style>html,body{margin:0;padding:0;background:transparent!important;}"
-        "svg{display:block;}</style></head><body>"
+        "svg{display:block;" + svg_filter + "}</style></head><body>"
         + svg_text
         + "</body></html>"
     )
@@ -1462,23 +1701,28 @@ def _rasterize_svg_to_png(page, svg_path, png_path):
     )
 
 
-def _prepare_ebook_html(html_path, dest_html, browser):
+def _prepare_ebook_html(html_path, dest_html, browser, bw=False):
     """電子書籍用 HTML: Mermaid SVG を透明 PNG に替え、背景が浮かない CSS を足す。"""
     with open(html_path, encoding="utf-8") as f:
         html = f.read()
     soup = BeautifulSoup(html, "html.parser")
     head = soup.find("head")
     style = soup.find("style")
+    extra_css = _EBOOK_DIAGRAM_CSS
+    if bw:
+        extra_css += "\n" + _codehilite_css(bw=True)
     if style is not None:
         raw = style.string or ""
         raw = raw.replace(
             "img, svg, video { max-width: 100%; height: auto; display: block; margin: 0.8em auto; }",
             "img:not(.diagram), svg, video { max-width: 100%; height: auto; display: block; margin: 0.8em auto; }",
         )
-        style.string = raw + "\n" + _EBOOK_DIAGRAM_CSS
+        if bw:
+            raw = _strip_highlight_css(raw)
+        style.string = raw + "\n" + extra_css
     elif head is not None:
         new_style = soup.new_tag("style")
-        new_style.string = _EBOOK_DIAGRAM_CSS
+        new_style.string = extra_css
         head.append(new_style)
 
     workdir = os.path.dirname(os.path.abspath(html_path))
@@ -1490,7 +1734,9 @@ def _prepare_ebook_html(html_path, dest_html, browser):
         targets.append((img, src))
 
     if targets:
-        log("  Kindle 向けに図を PNG 化しています (0/%d)..." % len(targets))
+        log("  Kindle 向けに図を PNG 化しています (0/%d)%s..." % (
+            len(targets), " [白黒]" if bw else "",
+        ))
         page = browser.new_page(
             viewport={"width": 2400, "height": 2400},
             device_scale_factor=2,
@@ -1499,19 +1745,21 @@ def _prepare_ebook_html(html_path, dest_html, browser):
             total = len(targets)
             for i, (img, src) in enumerate(targets, 1):
                 svg_path = os.path.normpath(os.path.join(workdir, src))
-                png_rel = os.path.splitext(src)[0] + ".png"
+                png_rel = os.path.splitext(src)[0] + (".bw.png" if bw else ".png")
                 png_path = os.path.normpath(os.path.join(workdir, png_rel))
                 base = os.path.basename(svg_path)
                 cache_png = None
                 if base.startswith("mermaid_") and base.lower().endswith(".svg"):
-                    cache_png = os.path.join(CACHE_DIR, base[8:-4] + ".png")
+                    cache_png = os.path.join(
+                        CACHE_DIR, base[8:-4] + (".bw.png" if bw else ".png")
+                    )
                 if not os.path.isfile(png_path) and cache_png and os.path.isfile(cache_png):
                     os.makedirs(os.path.dirname(png_path), exist_ok=True)
                     shutil.copy2(cache_png, png_path)
                 if not os.path.isfile(png_path) and os.path.isfile(svg_path):
                     os.makedirs(os.path.dirname(png_path), exist_ok=True)
                     try:
-                        _rasterize_svg_to_png(page, svg_path, png_path)
+                        _rasterize_svg_to_png(page, svg_path, png_path, grayscale=bw)
                         if cache_png:
                             os.makedirs(os.path.dirname(cache_png), exist_ok=True)
                             shutil.copy2(png_path, cache_png)
@@ -1542,6 +1790,38 @@ def _prepare_ebook_html(html_path, dest_html, browser):
             except Exception:
                 pass
 
+    if bw:
+        photos = []
+        for img in soup.find_all("img"):
+            src = (img.get("src") or "").replace("\\", "/")
+            if not src or src.lower().endswith(".svg"):
+                continue
+            if ".bw." in os.path.basename(src).lower():
+                continue
+            if _is_cover_img(img):
+                continue
+            photos.append((img, src))
+        if photos:
+            log("  写真を白黒化しています (0/%d)..." % len(photos))
+            for i, (img, src) in enumerate(photos, 1):
+                src_path = os.path.normpath(os.path.join(workdir, src))
+                dest_rel = _bw_variant_rel(src)
+                dest_path = os.path.normpath(os.path.join(workdir, dest_rel))
+                if os.path.isfile(src_path):
+                    try:
+                        if not os.path.isfile(dest_path):
+                            _write_grayscale_image(src_path, dest_path)
+                        if os.path.isfile(dest_path):
+                            img["src"] = dest_rel.replace("\\", "/")
+                    except ImportError:
+                        log("  ! 画像の白黒化には Pillow が必要です: pip install Pillow")
+                        break
+                    except Exception as e:
+                        log("  ! 白黒化に失敗: " + os.path.basename(src) + " (" + _short_err(e) + ")")
+                        log_verbose(repr(e))
+                if i == 1 or i == len(photos) or i % 10 == 0:
+                    log("  写真を白黒化しています (%d/%d)" % (i, len(photos)))
+
     os.makedirs(os.path.dirname(dest_html), exist_ok=True)
     with open(dest_html, "w", encoding="utf-8") as f:
         f.write(str(soup))
@@ -1562,7 +1842,7 @@ def _calibre_cli_text(text):
         return None
 
 
-def html_to_ebook(html_path, dest_path, fmt, title=None, author=None, cover_path=None):
+def html_to_ebook(html_path, dest_path, fmt, title=None, author=None, cover_path=None, bw=False):
     fmt = str(fmt).lower().lstrip(".")
     if fmt != "epub":
         raise ValueError("未対応の電子書籍形式です: " + fmt + "（Kindle 向けは EPUB のみ）")
@@ -1598,7 +1878,7 @@ def html_to_ebook(html_path, dest_path, fmt, title=None, author=None, cover_path
             raise RuntimeError("図を PNG 化するのに Playwright が必要です。\n" + err)
         opened_browser = True
     try:
-        _prepare_ebook_html(html_path, in_tmp, browser)
+        _prepare_ebook_html(html_path, in_tmp, browser, bw=bw)
     finally:
         if opened_browser:
             close_browser()
@@ -1681,17 +1961,45 @@ def html_to_ebook(html_path, dest_path, fmt, title=None, author=None, cover_path
         raise RuntimeError(label + " ファイルが作られませんでした: " + dest_path)
 
 
-def html_to_epub(html_path, epub_path, title=None, author=None, cover_path=None):
-    html_to_ebook(html_path, epub_path, "epub", title=title, author=author, cover_path=cover_path)
+def html_to_epub(html_path, epub_path, title=None, author=None, cover_path=None, bw=False):
+    html_to_ebook(html_path, epub_path, "epub", title=title, author=author, cover_path=cover_path, bw=bw)
 
 
-def cmd_convert_only(want_pdf, want_epub=False):
+def cmd_convert_only(want_pdf, want_epub=False, bw=False, source_url=None):
     html_path = find_book_html_for_pdf(OUT_DIR)
     if not html_path:
         log("エラー: %s に結合 HTML が見つかりません。先に本の取得を実行してください。" % OUT_DIR)
         return 1
     stem = os.path.splitext(os.path.basename(html_path))[0]
     pdf_path = os.path.join(OUT_DIR, stem + ".pdf")
+
+    try:
+        with open(html_path, encoding="utf-8") as f:
+            html_text = f.read()
+        html_url = source_url_from_html(html_text)
+        if source_url and html_url and not should_reuse_cached_book(source_url, html_url):
+            log("エラー: 既存 HTML の出典と指定 URL が一致しません。")
+            log("  既存: " + html_url)
+            log("  指定: " + source_url)
+            return 1
+        found_url = html_url or source_url
+        if found_url:
+            try:
+                username, book_slug = parse_book_url(found_url)
+                found_url = canonical_book_url(username, book_slug)
+            except ValueError:
+                pass
+            _title, html_author, _cover = metadata_from_book_html(html_path)
+            new_html = ensure_colophon_html(html_text, found_url, html_author)
+            if new_html != html_text:
+                with open(html_path, "w", encoding="utf-8") as f:
+                    f.write(new_html)
+                log("  巻末に出典 URL と著作権表示を追加しました")
+        elif not re.search(r'class=["\']colophon["\']', html_text):
+            log("  奥付を付けるには、本の URL を付けて再実行するか、HTML を再生成してください。")
+    except Exception as e:
+        log("  ! 奥付の追加に失敗しました: " + _short_err(e))
+        log_verbose(repr(e))
 
     ebook_jobs = []
     if want_epub:
@@ -1733,7 +2041,7 @@ def cmd_convert_only(want_pdf, want_epub=False):
         dest = os.path.join(OUT_DIR, stem + "." + fmt)
         log("[%d/%d] %s を生成しています" % (step, steps, label))
         try:
-            html_to_ebook(html_path, dest, fmt)
+            html_to_ebook(html_path, dest, fmt, bw=bw)
             size_mb = os.path.getsize(dest) / (1024 * 1024)
             log("  %s: %s (%.2f MB)" % (label, os.path.abspath(dest), size_mb))
         except Exception as e:
@@ -1760,21 +2068,51 @@ def main(argv=None):
 
     t0 = time.monotonic()
 
-    if args.pdf_only or args.epub_only:
+    convert_only = args.pdf_only or args.epub_only
+    if convert_only:
         want_pdf = bool(args.pdf_only)
         want_epub = bool(args.epub_only or args.epub) and not args.no_epub
-        return cmd_convert_only(want_pdf, want_epub)
+        if args.url:
+            try:
+                parse_book_url(args.url)
+            except ValueError as e:
+                log("エラー: " + str(e))
+                return 1
+        cached_url = read_cached_book_url(OUT_DIR)
+        if should_reuse_cached_book(args.url, cached_url):
+            if cached_url:
+                if args.url:
+                    log("  既存 HTML の出典と一致したので再取得しません: " + cached_url)
+                else:
+                    log("  既存 HTML を使います: " + cached_url)
+            return cmd_convert_only(
+                want_pdf, want_epub, bw=args.bw, source_url=args.url or cached_url,
+            )
+        arg_canon = canonical_book_url(*parse_book_url(args.url))
+        if cached_url:
+            log("  既存 HTML の出典が指定 URL と違うので、取得からやり直します")
+            log("    既存: " + cached_url)
+            log("    指定: " + arg_canon)
+        elif find_book_html_for_pdf(OUT_DIR):
+            log("  既存 HTML に出典 URL が無いので、取得からやり直します: " + arg_canon)
+        else:
+            log("  結合 HTML が無いので、取得してから変換します: " + arg_canon)
+        start_url = args.url
+        html_only = not want_pdf
+        need_pdf = want_pdf
+        need_epub = want_epub
+    else:
+        start_url = args.url or DEFAULT_URL
+        html_only = args.html_only
+        need_pdf = not html_only
+        need_epub = bool(args.epub) and not args.no_epub
+        if not args.url:
+            log("URL が無いのでデフォルトの本を使います: " + start_url)
 
-    start_url = args.url or DEFAULT_URL
-    html_only = args.html_only
-    need_pdf = not html_only
-    need_epub = bool(args.epub) and not args.no_epub
     steps = 4 + int(need_pdf) + int(need_epub)
 
-    if not args.url:
-        log("URL が無いのでデフォルトの本を使います: " + start_url)
-
     username, book_slug = parse_book_url(start_url)
+    source_url = canonical_book_url(username, book_slug)
 
     shutil.rmtree(IMG_DIR, ignore_errors=True)
     shutil.rmtree(CHAPTERS_DIR, ignore_errors=True)
@@ -1921,6 +2259,7 @@ def main(argv=None):
 
     html_doc = build_book_html(
         book_title, book_subtitle, author, cover_image_local, chapters,
+        source_url=source_url,
     )
     out_html = os.path.join(OUT_DIR, html_name)
     with open(out_html, "w", encoding="utf-8") as f:
@@ -1968,6 +2307,7 @@ def main(argv=None):
                 title=book_title,
                 author=author,
                 cover_path=cover_abs,
+                bw=args.bw,
             )
             ebook_results["epub"] = {
                 "ok": True,
